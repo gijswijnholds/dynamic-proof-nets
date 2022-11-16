@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import random
 import torch
 from torch import Tensor
 from torch.nn.utils.rnn import pad_sequence as _pad_sequence
@@ -58,6 +58,69 @@ def batchify_encoder_inputs(token_ids: list[list[int]],
                          torch.tensor(edge_distance)),
             sent_lens)
 
+def pair_batchify_encoder_inputs(token_ids_presents: list[list[int]],
+                                 token_ids_postsents: list[list[int]],
+                                 token_clusters: list[list[int]],
+                                 pad_token_id: int,
+                                 cls_dist: int = -999) -> tuple[EncoderBatch, list[int]]:
+    sent_lens = [max(t) + 1 for t in token_clusters]
+    edge_index, edge_distance = zip(*sent_lengths_to_edges(sent_lens, cls_dist))
+
+    present_cutoffs = list(map(len, token_ids_presents))
+    long_token_ids = [[1]+pres+posts[1:] for (pres, posts) in zip(token_ids_presents, token_ids_postsents)]
+    token_ids = pad_sequence(list(map(torch.tensor, long_token_ids)), padding_value=pad_token_id)
+
+    attention_mask = token_ids.ne(pad_token_id).long()
+    for i, l in enumerate(present_cutoffs):
+        attention_mask[i][1:(l+1)] = 0
+
+    long_token_clusters = [cluster_ids[:1] + l*[-1] + cluster_ids[1:] for (l, cluster_ids) in zip(present_cutoffs, token_clusters)]
+    token_clusters = pad_sequence(list(map(torch.tensor, long_token_clusters)), padding_value=-1)
+    offsets = (token_clusters.max(dim=-1).values + 1).cumsum(dim=-1).roll(1, 0).unsqueeze(-1)
+    offsets[0] = 0
+    token_clusters = token_clusters + offsets
+    for i, l in enumerate(present_cutoffs):
+        token_clusters[i][1:(l+1)] = -1
+
+    return (EncoderBatch(token_ids,
+                         attention_mask,
+                         token_clusters,
+                         torch.tensor(edge_index).t(),
+                         torch.tensor(edge_distance)),
+            sent_lens)
+
+def pair_batchify_encoder_inputs_after(token_ids_presents: list[list[int]],
+                                 token_ids_postsents: list[list[int]],
+                                 token_clusters: list[list[int]],
+                                 pad_token_id: int,
+                                 cls_dist: int = -999) -> tuple[EncoderBatch, list[int]]:
+    sent_lens = [max(t) + 1 for t in token_clusters]
+    edge_index, edge_distance = zip(*sent_lengths_to_edges(sent_lens, cls_dist))
+
+    present_cutoffs = list(map(len, token_ids_presents))
+    long_token_ids = [posts+pres for (pres, posts) in zip(token_ids_presents, token_ids_postsents)]
+    token_ids = pad_sequence(list(map(torch.tensor, long_token_ids)), padding_value=pad_token_id)
+    max_token_id_len = token_ids.shape[1]
+    attention_mask = token_ids.ne(pad_token_id).long()
+    for i, (l, psent) in enumerate(zip(present_cutoffs, token_ids_postsents)):
+        left, right = len(psent), len(psent)+l
+        attention_mask[i][left:right] = 0
+
+    long_token_clusters = [cluster_ids + l*[-1] for (l, cluster_ids) in zip(present_cutoffs, token_clusters)]
+    token_clusters = pad_sequence(list(map(torch.tensor, long_token_clusters)), padding_value=-1)
+    offsets = (token_clusters.max(dim=-1).values + 1).cumsum(dim=-1).roll(1, 0).unsqueeze(-1)
+    offsets[0] = 0
+    token_clusters = token_clusters + offsets
+    for i, (l, psent) in enumerate(zip(present_cutoffs, token_ids_postsents)):
+        left, right = len(psent), len(psent)+l
+        token_clusters[i][left:right] = -1
+
+    return (EncoderBatch(token_ids,
+                         attention_mask,
+                         token_clusters,
+                         torch.tensor(edge_index).t(),
+                         torch.tensor(edge_distance)),
+            sent_lens)
 
 @dataclass
 class DecoderBatch:
@@ -211,10 +274,16 @@ def collate_fn(batch_items: BatchInput,
                cls_dist: int = -999) -> Batch:
     tokenized_sentences, tokenized_trees, tokenized_matchings = zip(*batch_items)
     sentential_token_ids, sentential_cluster_ids = zip(*tokenized_sentences)
-    encoder_batch, sent_lens = batchify_encoder_inputs(sentential_token_ids,
-                                                       sentential_cluster_ids,
-                                                       pad_token_id,
-                                                       cls_dist)
+    pre_token_ids = len(sentential_token_ids)*[random.randint(5,80)*[33]]
+    encoder_batch, sent_lens = pair_batchify_encoder_inputs(pre_token_ids,
+                                                                  sentential_token_ids,
+                                                                  sentential_cluster_ids,
+                                                                  pad_token_id,
+                                                                  cls_dist)
+    # encoder_batch, sent_lens = batchify_encoder_inputs(sentential_token_ids,
+    #                                                    sentential_cluster_ids,
+    #                                                    pad_token_id,
+    #                                                    cls_dist)
     decoder_batch = batchify_decoder_inputs(tokenized_trees)
     if tokenized_matchings is not None:
         parser_batch = batchify_parser_inputs(tokenized_matchings, decoder_batch, sent_lens)
@@ -241,3 +310,4 @@ def make_loader(data: TokenizedSamples,
     if sort:
         subset = sorted(subset, key=lambda sample: len(sample[0][0]))
     return DataLoader(subset, shuffle=not sort, collate_fn=cfn, batch_size=batch_size)
+

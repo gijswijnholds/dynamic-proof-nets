@@ -22,8 +22,8 @@ MAX_SEQ_LEN = 199
 NUM_SYMBOLS = 80
 FIRST_BINARY = 31
 MAX_DEPTH = 15
-BATCH_SIZE = 64
-
+# BATCH_SIZE = 64
+BATCH_SIZE = 32
 
 def train(device: torch.device = 'cuda',
           encoder_core: str = 'GroNLP/bert-base-dutch-cased',
@@ -97,7 +97,10 @@ def train(device: torch.device = 'cuda',
         ################################################################################################################
         # epoch loop
         ################################################################################################################
+        b_count = 0
         for batch in dl:
+            b_count += 1
+            logprint(f"Epoch {epoch}, Batch {b_count}/{len(dl)}")
             opt.zero_grad(set_to_none=True)
             token_preds, matches = model.forward_train(
                 input_ids=batch.encoder_batch.token_ids,
