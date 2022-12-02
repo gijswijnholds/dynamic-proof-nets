@@ -7,7 +7,8 @@ from dyngraphpn.neural.model import Parser
 from dyngraphpn.data.tokenization import (Tokenizer, AtomTokenizer, Leaf, Symbol, Tree,
                                           group_trees, index_ptrees)
 from dyngraphpn.data.processing import merge_on_word_starts, get_word_starts
-from dyngraphpn.neural.batching import batchify_encoder_inputs, ptrees_to_candidates, BackPointer
+from dyngraphpn.neural.batching import (batchify_encoder_inputs, pair_batchify_encoder_inputs,
+                                        ptrees_to_candidates, BackPointer)
 from interface.aethel import (tree_to_ft, links_to_proof, ft_to_type,
                               LexicalPhrase, LexicalItem, Proof,
                               AxiomLinks, FormulaTree, Atoms)
@@ -68,6 +69,42 @@ class InferenceWrapper:
                              list(accumulate(sent_lens)))
         analyses: list[Analysis] = []
         for i, (words, ptrees) in enumerate(zip(split_sents, groups)):
+            words, ptrees = merge_and_index(words, ptrees)
+            f_conclusion, f_assignments = ptrees_to_formulas(ptrees)
+            lex_phrases = make_lex_phrases(words, f_assignments)
+            if (candidates := ptrees_to_candidates(ptrees)) is not None:
+                grouped_matches = self.parser.link(decoder_reprs, candidates.indices, training=False)
+                links = matches_to_links(grouped_matches, candidates.backpointers)
+                proof = attempt_traversal(links, f_assignments, f_conclusion)
+            else:
+                proof = ValueError('Invariance check failed.')
+            analyses.append(Analysis(lexical_phrases=lex_phrases, proof=proof))
+        return analyses
+
+    @torch.no_grad()
+    def analyze_pairs(self, sentence_pairs: list[tuple[str, str]]) -> list[Analysis]:
+        presents, postsents = [s1 for s1, _ in sentence_pairs], [s2 for _, s2 in sentence_pairs]
+        tokenized_presents, split_presents = zip(*map(self.tokenizer.encode_sentence, presents))
+        tokenized_postsents, split_postsents = zip(*map(self.tokenizer.encode_sentence, postsents))
+        pre_token_ids, pre_cluster_ids = zip(*tokenized_presents)
+        post_token_ids, post_cluster_ids = zip(*tokenized_postsents)
+        encoder_batch, sent_lens = pair_batchify_encoder_inputs(token_ids_presents=pre_token_ids,
+                                                                token_ids_postsents=post_token_ids,
+                                                                token_clusters=post_cluster_ids,
+                                                                pad_token_id=self.tokenizer.core.pad_token_id)
+        encoder_batch = encoder_batch.to(self.device)
+        (node_ids, decoder_reprs, node_pos) \
+            = self.parser.forward_dev(input_ids=encoder_batch.token_ids,
+                                      attention_mask=encoder_batch.atn_mask,
+                                      token_clusters=encoder_batch.cluster_ids,
+                                      root_edge_index=encoder_batch.edge_index,
+                                      root_dist=encoder_batch.edge_attr,
+                                      first_binary=31,
+                                      max_type_depth=16)
+        groups = group_trees(self.atom_tokenizer.levels_to_ptrees([n.tolist() for n in node_ids]),
+                             list(accumulate(sent_lens)))
+        analyses: list[Analysis] = []
+        for i, (words, ptrees) in enumerate(zip(split_postsents, groups)):
             words, ptrees = merge_and_index(words, ptrees)
             f_conclusion, f_assignments = ptrees_to_formulas(ptrees)
             lex_phrases = make_lex_phrases(words, f_assignments)
