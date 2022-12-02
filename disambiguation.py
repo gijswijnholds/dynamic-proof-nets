@@ -1,84 +1,92 @@
-from inference import InferenceWrapper
-from LassyExtraction.frontend import Sample
-from dyngraphpn.neural.batching import batchify_encoder_inputs, pair_batchify_encoder_inputs
+from dataclasses import dataclass
+import pickle
+from inference import InferenceWrapper, Analysis
+from sample_generation import PairSample, generate_all_samples
+from tqdm import tqdm
+from LassyExtraction.frontend import serialize_phrase, deserialize_phrase
+from LassyExtraction.mill.serialization import serialize_proof, deserialize_proof
+from LassyExtraction.mill.types import TypeInference
+from LassyExtraction.mill.proofs import Proof
 
-def load_model():
+def load_original_parser():
     return InferenceWrapper(weight_path='./data/model_weights.pt',
                             atom_map_path='./data/atom_map.tsv',
                             config_path='./data/bert_config.json',
                             device='cpu')
 
-sent1 = "De patiënt geneest de dokter."
-sent2 = "De dokter geneest de patiënt."
-sent3 = "De patiënt die de dokter geneest, was ziek."
-sent4 = "De dokter die de patiënt geneest, was ziek."
-sent5 = "Ik ben snel naar huis gegaan en toen nog even gaan douchen."
-sent6 = "Ze is moe."
 
-def test(model, sentences):
-    analyses = model.analyze([sent1, sent2, sent3, sent4])
-    for a in analyses:
-        print(Sample(a.lexical_phrases, a.proof, "", "").show_term(show_types=False, show_words=True))
+def load_pair_parser():
+    return InferenceWrapper(weight_path='./data/model_22.pt',
+                            atom_map_path='./data/atom_map.tsv',
+                            config_path='./data/bert_config.json',
+                            device='cpu')
 
 
-model = load_model()
-test(model, [sent1, sent2, sent3, sent4])
-
-present1, postsent1 = sent5, sent1
-present2, postsent2 = sent6, sent3
-
-# Implement pair batching so that the output for [(present1, postsent1), (present2, postsent2)]
-# contains the results of original batching of [postsent1, postsent2]
-
-def test_case(model, present1, postsent1, present2, postsent2):
-    sentences = [postsent1, postsent2]
-    tokenized_sents, split_sents = zip(*map(model.tokenizer.encode_sentence, sentences))
-    token_ids, cluster_ids = zip(*tokenized_sents)
-    encoder_batch, sent_lens = batchify_encoder_inputs(token_ids=token_ids,
-                                                       token_clusters=cluster_ids,
-                                                       pad_token_id=model.tokenizer.core.pad_token_id)
-
-    paired_sentences = [(present1, postsent1), (present2, postsent2)]
-    pair_tokenized_sents, pair_split_sents = ...
-    pair_token_ids, pair_cluster_ids = ...
-
-    pair_batchify_encoder_inputs()
-
-attention_mask2 = torch.tensor([[0, 0, 0, 0], [0, 0, 0, 0]])
-attention_mask3 = torch.tensor([[1, 1, 1, 1], [1, 1, 1, 1]])
-token_ids2 = torch.tensor([[1, 312, 313, 2], [1, 412, 413, 2]])
-token_clusters2 = torch.tensor([[-1, -1, -1, -1], [-1, -1, -1, -1]])
-
-new_attention_mask = torch.cat([attention_mask2, attention_mask], dim=1)
-new_token_ids = torch.cat([token_ids2, token_ids], dim=1)
-new_token_clusters = torch.cat([token_clusters2, token_clusters], dim=1)
-
-new_attention_mask_back = torch.cat([attention_mask, attention_mask2], dim=1)
-new_token_ids_back = torch.cat([token_ids, token_ids2], dim=1)
-new_token_clusters_back = torch.cat([token_clusters, token_clusters2], dim=1)
-
-new_attention_mask_back3 = torch.cat([attention_mask, attention_mask3], dim=1)
-new_token_ids_back3 = torch.cat([token_ids, token_ids2], dim=1)
-new_token_clusters_back3 = torch.cat([token_clusters, token_clusters2], dim=1)
-
-result = encoder.forward(token_ids, attention_mask, token_clusters)
-new_result = encoder.forward(new_token_ids, new_attention_mask, new_token_clusters)
-new_result_back = encoder.forward(new_token_ids_back, new_attention_mask_back, new_token_clusters_back)
-
-new_results_back3 = encoder.forward(new_token_ids_back3, new_attention_mask_back3, new_token_clusters_back3)
+@dataclass(frozen=True)
+class AnalyzedPairSample:
+    sample: PairSample
+    analysis: Analysis
 
 
-sent5 = "Ik ben snel naar huis gegaan en toen nog even gaan douchen."
-sent6 = "Ze is moe."
-tok_ids5, cluster_ids5=tokenizer.encode_words(sent5.replace(".", " .").split())
-tok_ids6, cluster_ids6=tokenizer.encode_words(sent6.replace(".", " .").split())
+def analyze_samples(parser, pair_samples: list[PairSample]) -> list[AnalyzedPairSample]:
+    sentence_pairs = [(s.present, s.postsent) for s in pair_samples]
+    return list(map(lambda sa: AnalyzedPairSample(*sa), zip(pair_samples, parser.analyze_pairs(sentence_pairs))))
 
-tokenizer = Tokenizer('GroNLP/bert-base-dutch-cased', 'bert')
-sent2 = "De dokter geneest de patiënt."
-sent3 = "De patiënt die de dokter geneest, was ziek."
-tok_ids2, cluster_ids2 = tokenizer.encode_words(sent2.replace(".", " .").split())
-tok_ids3, cluster_ids3 = tokenizer.encode_words(sent3.replace(".", " .").split())
-token_ids_presents, cluster_ids_presents = [tok_ids2, tok_ids3], [cluster_ids2, cluster_ids3]
-orig_batch = batchify_encoder_inputs(token_ids_presents, cluster_ids_presents, 3)[0]
-new_batch = pair_batchify_encoder_inputs(2*[10*[33]], token_ids_presents, cluster_ids_presents, 3)[0]
-token_ids_postsents, cluster_ids_postsents = [tok_ids5, tok_ids6], [cluster_ids5, cluster_ids6]
+
+def split_in_batches(lst, n):
+    return [lst[i:i + n] for i in range(0, len(lst), n)]
+
+
+def robust_serialize_proof(proof):
+    if isinstance(proof, ValueError):
+        return proof
+    elif isinstance(proof, TypeInference.TypeCheckError):
+        return proof
+    else:
+        return serialize_proof(proof)
+
+
+def robust_deserialize_proof(proof):
+    if isinstance(proof, ValueError):
+        return proof
+    elif isinstance(proof, TypeInference.TypeCheckError):
+        return proof
+    else:
+        return deserialize_proof(proof)
+
+
+def serialize_ap_sample(sample: AnalyzedPairSample):
+    return (sample.sample,
+            tuple(serialize_phrase(phrase) for phrase in sample.analysis.lexical_phrases),
+            robust_serialize_proof(sample.analysis.proof))
+
+
+def deserialize_ap_sample(sample) -> AnalyzedPairSample:
+    pair_sample, lexical_phrases, proof = sample
+    analysis = Analysis(lexical_phrases=tuple(deserialize_phrase(phrase) for phrase in lexical_phrases),
+                        proof=robust_deserialize_proof(proof))
+    return AnalyzedPairSample(sample=pair_sample, analysis=analysis)
+
+
+def save_ap_samples(ap_samples: list[AnalyzedPairSample], out_path: str):
+    with open(out_path, 'wb') as outf:
+        pickle.dump(list(map(serialize_ap_sample, ap_samples)), outf)
+
+def save_results(results: list[tuple[AnalyzedPairSample, bool]], out_path: str):
+    with open(out_path, 'wb') as outf:
+        pickle.dump(list(map(lambda sr: serialize_ap_sample(sr[0], sr[1]), results)), outf)
+
+def load_ap_samples(in_path: str):
+    with open(in_path, 'rb') as inf:
+        data = pickle.load(inf)
+    return list(map(deserialize_ap_sample, data))
+
+
+def main():
+    parser = load_pair_parser()
+    all_samples = generate_all_samples()
+    sample_batches = split_in_batches(all_samples, 2000)
+    sample_analyses = sum([analyze_samples(parser, batch) for batch in tqdm(sample_batches)], [])
+    save_ap_samples(sample_analyses, './results/pair_parses_no_context.p')
+    # sample_results = get_results(sample_analyses)
+    # save_results(sample_results, './results/pair_parses_no_context_results.p')
